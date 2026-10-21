@@ -117,14 +117,14 @@ def _join_pos(ot_alleles, ob_alleles, multiallelic=False):
         ob_alleles_d=dict(ob_alleles)
         als = {k : ot_alleles_d.get(k, 0) + ob_alleles_d.get(k, 0)
                 for k in set(ot_alleles_d) | set(ob_alleles_d)
-                if k is not 'C_T' and k is not 'A_G'}
+                if k != 'C_T' and k != 'A_G'}
         return sorted(als, key=als.get, reverse=True)[:2]
     else:
         return list(set(
             [al[0] for al in ot_alleles
-                if al[0] is not 'C_T'] +
+                if al[0] != 'C_T'] +
             [al[0] for al in ob_alleles
-                if al[0] is not 'A_G']))
+                if al[0] != 'A_G']))
 
 def _join_alleles(ot_alleles, ob_alleles, multiallelic=False):
     return { pos :_join_pos(ot_alleles[pos], ob_alleles[pos], multiallelic=multiallelic)
@@ -141,12 +141,12 @@ def _correct_reads(reads, alleles, strand='ot'):
     for i, r in reads.iterrows():
         if (r['snp_allele'] in alleles[r['snp_pos']]):
             continue
-        elif ((strand is 'ot') and
-                (r['snp_allele'] is 'T') and
+        elif ((strand == 'ot') and
+                (r['snp_allele'] == 'T') and
                 ('C' in alleles[r['snp_pos']])):
             aux.at[i, 'snp_allele'] = 'C'
-        elif ((strand is 'ob') and
-                (r['snp_allele'] is 'A') and
+        elif ((strand == 'ob') and
+                (r['snp_allele'] == 'A') and
                 ('G' in alleles[r['snp_pos']])):
             aux.at[i, 'snp_allele'] = 'G'
         else:
@@ -155,7 +155,7 @@ def _correct_reads(reads, alleles, strand='ot'):
 
 def correct_reads(reads, alleles, strand='ot'):
     positions = list(alleles.keys())
-    conf_bases = ['C', 'T'] if strand is 'ot' else ['A', 'G']
+    conf_bases = ['C', 'T'] if strand == 'ot' else ['A', 'G']
     conf_pos = [pos
             for pos, bases in alleles.items()
             if ((conf_bases[0] in bases) and
@@ -187,7 +187,7 @@ def _parse_args():
     parser.add_argument('-a', '--align', type=str,
                                help='path to Bismark alignments folder')
     parser.add_argument('-s', '--snps', type=str,
-                               help='path to SNPs folder')
+                               help='path to SNPs folder (assuming it contains a VCF file) or specific file (in VCF format)')
     parser.add_argument('-c', '--coverage', type=int,
                                help='minimum coverage')
     parser.add_argument('-t', '--threshold', type=float,
@@ -256,8 +256,8 @@ def main():
 
     if os.path.isdir(args.snps):
         snps_fd = f"{args.snps}/{root_fn}/"
-        # TO DO: Remove this
-        snps_fn = glob.glob(f"{snps_fd}*.strain.vcf")[0]
+        snps_fn = glob.glob(f"{snps_fd}*.vcf")[0]
+
     else:
         snps_fn = args.snps
 
