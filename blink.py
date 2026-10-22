@@ -10,6 +10,17 @@ import pysam
 from collections import defaultdict as ddict
 import sys, os, glob
 
+def _find_file(pattern, description, required=True):
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        if required:
+            sys.exit(f'ERROR: No {description} found matching {pattern}. Exiting')
+        return None
+    if len(matches) > 1:
+        print(f'WARNING: {len(matches)} {description} files match {pattern}; '
+              f'using {matches[0]}')
+    return matches[0]
+
 def read_meth(fn, is_ob=False):
     if fn is None:
         return pd.DataFrame(
@@ -27,33 +38,101 @@ def print_log(msg, verbose=True):
     if verbose:
         print(msg)
 
-def filter_snps(snps, freq='ref', verbose=True):
+def filter_snps(snps, freq='ref', expected=True, verbose=True):
     pos = []
     for x in snps.fetch():
         alt = x.alts[0]
         if not (len(x.ref) < 2) or not (len(alt) < 2):
             print_log(
-                f'> Position {x.pos} discarded - structural variant',
+                f'> Position {x.pos} discarded - INDEL variant',
                 verbose)
             continue
-        dp4 = x.info['DP4']
-        dp = x.info['DP']
-        if freq == 'ref':
-            ref_prop = (dp4[0] + dp4[1])/dp
-            pos_dict = {'pos' : x.pos, 'ref' : x.ref,
-                    'alt' : alt, 'ref_prop_exp' : ref_prop}
+        if not expected:
+            pos_dict = {'pos' : x.pos, 'ref' : x.ref, 'alt' : alt}
         else:
-            try:
-                alt_prop = x.info['AF']
-            except:
+            dp4 = x.info['DP4']
+            dp = x.info['DP']
+            if freq == 'ref':
+                ref_prop = (dp4[0] + dp4[1])/dp
+                pos_dict = {'pos' : x.pos, 'ref' : x.ref,
+                        'alt' : alt, 'ref_prop_exp' : ref_prop}
+            else:
                 try:
-                    alt_prop = (dp4[2] + dp4[3])/dp
+                    alt_prop = x.info['AF'][0]
                 except:
-                    alt_prop = 0
-            pos_dict = {'pos' : x.pos, 'ref' : x.ref,
-                    'alt' : alt, 'alt_prop_exp' : alt_prop}
+                    try:
+                        alt_prop = (dp4[2] + dp4[3])/dp
+                    except:
+                        alt_prop = 0
+                pos_dict = {'pos' : x.pos, 'ref' : x.ref,
+                        'alt' : alt, 'alt_prop_exp' : alt_prop}
         pos.append(pos_dict)
     return pos
+
+def parse_vars_csv(snps_fn, freq='ref', expected=True, verbose=True):
+    print_log(
+            '>Reading variants input table', verbose)
+    variants = pd.read_csv(snps_fn)
+    if not {'pos', 'ref', 'alt'}.issubset(variants.columns):
+        sys.exit((
+            'ERROR: At least one required column (pos, ref, alt) '
+            'not present in variants input table. Exiting'))
+    if expected:
+        if not {'af'}.issubset(variants.columns):
+            sys.exit((
+                'ERROR: No column "af" present in variants input table. '
+                'Use -x to avoid requiring expected allele frequencies '
+                'or include the allele frequency information in the table. '
+                'Exiting.'))
+    print_log(
+            '>Variants input table read correctly',
+            verbose)
+    variants = _add_freq_table(_filter_vars_table(
+            variants, verbose=verbose),
+            freq=freq, expected=expected, verbose=verbose)
+    return variants
+
+def _filter_vars_table(variants, verbose=True):
+    print_log(
+            '>Filtering input variants', verbose)
+    variants = variants.drop_duplicates(['pos', 'ref', 'alt'])
+    print_log(
+            f'>{variants.shape[0]} distinct variants in input table',
+            verbose)
+
+    print_log('>Ignoring INDELs', verbose)
+    keep = (variants['ref'].str.len() == 1) & (variants['alt'].str.len() == 1)
+    filtered_variants = variants[keep].copy()
+
+    if variants.shape[0] == filtered_variants.shape[0]:
+        print_log('>All variants retained after filters', verbose)
+    else:
+        print_log(
+            f'>{filtered_variants.shape[0]} variants retained after filters',
+            verbose)
+    return filtered_variants
+
+def _add_freq_table(variants, freq='ref', expected=True, verbose=True):
+    if not expected:
+        return variants[['pos', 'ref', 'alt']]
+
+    variants = variants.copy()
+    variants['af'] = pd.to_numeric(variants['af'], errors='coerce')
+    variants = variants.dropna(subset=['af'])
+
+    col = freq + '_prop_exp'
+    if freq == 'alt':
+        variants = variants.rename(columns={'af' : col})
+    else:
+        total_alt = variants.groupby('pos')['af'].transform('sum')
+        if (total_alt > 1.0001).any():
+            print_log(
+                    'Warning: alt frequencies sum to >1 at some positions',
+                    verbose = verbose)
+        variants[col] = (1 - total_alt).clip(lower=0)
+        variants = variants.sort_values('af', ascending=False, kind='stable')
+
+    return variants[['pos', 'ref', 'alt', col]]
 
 def extract_bases(alignments, positions, ref='BK000964.3_looped_3008'):
     bases_reads = []
@@ -187,21 +266,23 @@ def _parse_args():
     parser.add_argument('-a', '--align', type=str,
                                help='path to Bismark alignments folder')
     parser.add_argument('-s', '--snps', type=str,
-                               help='path to SNPs folder (assuming it contains a VCF file) or specific file (in VCF format)')
+                               help='path to SNPs folder (assuming it contains a VCF file) or specific file (in VCF or CSV format)')
     parser.add_argument('-c', '--coverage', type=int,
                                help='minimum coverage')
     parser.add_argument('-t', '--threshold', type=float,
                                help='minimum allele frequency threshold')
     parser.add_argument('-f', '--freq', type=str, default='ref', choices=['alt', 'ref'],
                                help='allele on which to report frequency')
+    parser.add_argument('-x', '--ignore_expected', action='store_true',
+                               help='bypass retrieval/calculation of allele frequencies from input VCF/CSV')
     parser.add_argument('-i', '--informed', action='store_true',
-                               help='allow Blink to obtain alleles from input VCF')
+                               help='allow Blink to obtain alleles to seek in methylation data from input VCF/CSV')
     parser.add_argument('-p', '--pcr', action='store_true',
                                help='enable Blink to work with amplicons of only one directionality')
     parser.add_argument('-m', '--multiallelic', action='store_true',
                                help='permit more than two alleles per position')
     parser.add_argument('-n', '--name_reads', action='store_true',
-                               help='Changes read names to reduce output size')
+                               help='change read names to reduce output size')
     parser.add_argument('-v', '--verbose', action='store_true',
                                help='increase output verbosity')
 
@@ -211,9 +292,9 @@ def main():
 
 # 00.- Configuration
 
-    args=_parse_args()
+    args = _parse_args()
     root_fn = args.sample
-    region=args.region
+    region = args.region
 
     print(f"Starting blink execution for sample {root_fn}")
 
@@ -227,6 +308,7 @@ def main():
     multiallelic = args.multiallelic
     freq = args.freq
     name_reads = args.name_reads
+    expected = not args.ignore_expected
 
 ## Paths
 
@@ -237,30 +319,29 @@ def main():
 
     bme_fd = f"{args.bme}/{root_fn}/"
 
-    try:
-        ot_fn = glob.glob(f"{bme_fd}CpG_OT_*.txt")[0]
-    except:
-        ot_fn = None
-    try:
-        ob_fn = glob.glob(f"{bme_fd}CpG_OB_*.txt")[0]
-    except:
-        ob_fn = None
+    ot_fn = _find_file(f"{bme_fd}CpG_OT_*.txt", 'OT methylation file', required=False)
+    ob_fn = _find_file(f"{bme_fd}CpG_OB_*.txt", 'OB methylation file', required=False)
 
     if ot_fn is None and ob_fn is None:
-        sys.exit('ERROR: No OT or OB file present')
+        sys.exit('ERROR: No OT or OB file present. Exiting')
     elif (ot_fn is None or ob_fn is None) and not pcr:
-        sys.exit('ERROR: Both OT and OB files must be present')
+        sys.exit('ERROR: Both OT and OB files must be present. Exiting')
 
     als_fd = f"{args.align}/{root_fn}/"
-    als_fn = glob.glob(f"{als_fd}*.bam")[0]
+    als_fn = _find_file(f"{als_fd}*.bam", 'BAM file')
 
     if os.path.isdir(args.snps):
         snps_fd = f"{args.snps}/{root_fn}/"
-        snps_fn = glob.glob(f"{snps_fd}*.vcf")[0]
-
+        snps_fn = _find_file(f"{snps_fd}*.vcf", 'VCF file')
     else:
         snps_fn = args.snps
 
+    if snps_fn.endswith('.vcf'):
+        snps_ft = 'vcf'
+    elif snps_fn.endswith('.csv'):
+        snps_ft = 'csv'
+    else:
+        sys.exit('ERROR: SNPs file must be in VCF or CSV format. Exiting')
 
 # 01.- Read Bismark reports
 
@@ -269,8 +350,11 @@ def main():
 
 # 02.- Read SNPs
 
-    snps = pd.DataFrame(filter_snps(pysam.VariantFile(snps_fn, 'r'),
-        freq=freq, verbose=verbose))
+    if snps_ft == 'vcf':
+        snps = pd.DataFrame(filter_snps(pysam.VariantFile(snps_fn, 'r'),
+            freq=freq, expected=expected, verbose=verbose))
+    else:
+        snps = parse_vars_csv(snps_fn, freq=freq, expected=expected, verbose=verbose)
 
 # 03.- Read alignment files
 
@@ -320,12 +404,14 @@ def main():
             ot_counts, ob_counts, min_cov=min_cov, informed=informed)
 
     if informed:
-        positions=list(set(ot_counts.index.values) | set(ob_counts.index.values))
+        positions = list(set(ot_counts.index.values) | set(ob_counts.index.values))
         if not multiallelic:
-            if freq == 'ref':
-                snps = snps.groupby('pos').apply(lambda g: g[g['ref_prop_exp']==g['ref_prop_exp'].min()])
+            if not expected:
+                snps = snps.drop_duplicates('pos', keep='first')
             else:
-                snps = snps.groupby('pos').apply(lambda g: g[g['alt_prop_exp']==g['alt_prop_exp'].min()])
+                col = freq + '_prop_exp'
+                pick = 'idxmin' if freq == 'ref' else 'idxmax'
+                snps = snps.loc[snps.groupby('pos')[col].agg(pick)]
             alleles = { row['pos'] : [row['ref'], row['alt']]
                     for index, row in snps.iterrows()
                     if row['pos'] in positions }
